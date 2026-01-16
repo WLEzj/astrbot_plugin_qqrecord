@@ -21,7 +21,7 @@ class QQRecordPlugin(Star):
 
     _SANITIZE_PATTERN = re.compile(r"[^0-9A-Za-z_-]+")
     _LOG_ENCODING = os.environ.get("QQRECORD_LOG_ENCODING", "utf-8")
-    _LOG_ERRORS = "replace"
+    _LOG_ERRORS = os.environ.get("QQRECORD_LOG_ERRORS", "replace")
 
     def __init__(self, context: Context):
         super().__init__(context)
@@ -31,15 +31,12 @@ class QQRecordPlugin(Star):
 
     def _get_file_stub_and_name(self, event: AstrMessageEvent) -> tuple[str, str]:
         """根据事件类型返回文件后缀与展示名称。"""
-        try:
-            group = getattr(event.message_obj, "group", None)
-        except AttributeError:
-            group = None
+        group_obj = getattr(event.message_obj, "group", None) if event.message_obj else None
+        group_id_raw = event.get_group_id() or (getattr(group_obj, "group_id", None) if group_obj else None)
 
-        if group:
-            group_id = getattr(group, "group_id", None) or event.get_group_id() or "unknown"
-            group_name = getattr(group, "group_name", None)
-            group_id_str = str(group_id).strip()
+        if group_id_raw:
+            group_id_str = str(group_id_raw).strip()
+            group_name = getattr(group_obj, "group_name", None) if group_obj else None
             name = group_name or group_id_str or "未命名群"
             file_stub = f"group-{group_id_str or 'unknown'}"
         else:
@@ -102,6 +99,10 @@ class QQRecordPlugin(Star):
 
     async def initialize(self):
         logger.info("QQRecord 插件已初始化，记录路径: %s", self._data_dir)
+        if os.name == "nt":
+            logger.warning(
+                "QQRecord 正在 Windows 上运行，日志文件未自动收紧 ACL，请使用 icacls 手动限制访问。",
+            )
 
     def _format_line(self, content: str, group_name: str) -> str:
         """将消息格式化为“内容【群昵称】”行。"""
@@ -161,7 +162,9 @@ class QQRecordPlugin(Star):
 
             # 读取末尾若干行，limit 兜底范围。
             safe_limit = max(1, min(limit, 200))
-            lines = self._tail_lines(log_path, safe_limit)
+            # 读操作也使用写锁，避免并发写入时读取到半行。
+            async with self._write_lock:
+                lines = self._tail_lines(log_path, safe_limit)
 
             if not lines:
                 yield event.plain_result(f"日志为空，当前会话：{name}")
