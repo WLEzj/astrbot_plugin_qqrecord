@@ -81,5 +81,41 @@ class QQRecordPlugin(Star):
         except Exception as exc:  # noqa: BLE001 - 兜底避免插件崩溃
             logger.warning("QQRecord 处理消息失败: %s", exc)
 
+    @filter.command("record")
+    async def record_command(self, event: AstrMessageEvent, limit: int = 20):
+        """命令 `/record [limit]`：返回当前会话对应日志的最近 N 行。"""
+        try:
+            group = event.message_obj.group
+            # 决定读取哪个日志文件（群/私聊）。
+            if group:
+                file_stub = f"group-{(group.group_id or 'unknown').strip()}"
+                name = group.group_name or group.group_id or "未命名群"
+            else:
+                file_stub = f"private-{(event.get_sender_id() or 'unknown').strip()}"
+                name = event.get_sender_name() or event.get_sender_id() or "未命名用户"
+
+            log_path = self._data_dir / f"qqrecord-{file_stub}.log"
+            if not log_path.exists():
+                yield event.plain_result(f"未找到日志文件，当前会话：{name}")
+                return
+
+            # 读取末尾若干行，limit 兜底范围。
+            safe_limit = max(1, min(limit, 200))
+            lines: list[str] = []
+            with log_path.open("r", encoding="utf-8") as f:
+                for line in f.readlines()[-safe_limit:]:
+                    lines.append(line.rstrip("\n"))
+
+            if not lines:
+                yield event.plain_result(f"日志为空，当前会话：{name}")
+                return
+
+            # 组织输出，避免超长；最多显示 safe_limit 行。
+            preview = "\n".join(lines)
+            yield event.plain_result(f"最近 {len(lines)} 条记录（{name}）：\n{preview}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("QQRecord /record 命令失败: %s", exc)
+            yield event.plain_result("读取记录时出现错误，请稍后重试。")
+
     async def terminate(self):
         logger.info("QQRecord 插件已卸载。")
