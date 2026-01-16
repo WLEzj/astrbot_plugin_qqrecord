@@ -1,5 +1,4 @@
 import asyncio
-import datetime as dt
 import os
 import re
 from collections import deque
@@ -61,35 +60,28 @@ class QQRecordPlugin(Star):
                 logger.warning("QQRecord 无法设置安全权限: %s", path)
 
     @staticmethod
-    def _rotate_daily(path: Path) -> None:
-        """仅保留当日日志，跨日则删除旧文件以缩减体积。"""
-        if not path.exists():
-            return
-        try:
-            mtime = dt.datetime.fromtimestamp(path.stat().st_mtime).date()
-            if mtime < dt.date.today():
-                path.unlink(missing_ok=True)
-        except OSError:
-            logger.warning("QQRecord 清理旧日志失败: %s", path)
-
-    @staticmethod
-    def _tail_lines(path: Path, limit: int) -> list[str]:
-        """高效读取文件末尾 limit 行，避免遍历全量大文件。"""
-        if limit <= 0 or not path.exists():
-            return []
-        chunk = 4096
-        buf = bytearray()
-        newline_target = limit + 1  # 稍多读一些，保证截取足够行数
+    def _tail_lines(path: Path, limit: int, chunk_size: int = 4096) -> list[str]:
+        """高效读取文件末尾若干行，避免遍历整文件。"""
+        lines: list[str] = []
         with path.open("rb") as f:
             f.seek(0, os.SEEK_END)
+            buffer = b""
             pos = f.tell()
-            while pos > 0 and buf.count(b"\n") < newline_target:
-                read_size = min(chunk, pos)
+            while pos > 0 and len(lines) < limit:
+                read_size = chunk_size if pos >= chunk_size else pos
                 pos -= read_size
-                f.seek(pos)
-                buf[:0] = f.read(read_size)
-        text = buf.decode("utf-8", errors="ignore")
-        return text.splitlines()[-limit:]
+                f.seek(pos, os.SEEK_SET)
+                data = f.read(read_size)
+                buffer = data + buffer
+                parts = buffer.split(b"\n")
+                buffer = parts[0]
+                for line in reversed(parts[1:]):
+                    lines.append(line.decode("utf-8", "replace").rstrip("\r"))
+                    if len(lines) >= limit:
+                        break
+            if len(lines) < limit and buffer:
+                lines.append(buffer.decode("utf-8", "replace").rstrip("\r"))
+        return list(reversed(lines[-limit:]))
 
     async def initialize(self):
         logger.info("QQRecord 插件已初始化，记录路径: %s", self._data_dir)
@@ -110,7 +102,6 @@ class QQRecordPlugin(Star):
         file_path = self._data_dir / f"qqrecord-{stub}.log"
         try:
             async with self._write_lock:
-                self._rotate_daily(file_path)
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 is_new_file = not file_path.exists()
                 with file_path.open("a", encoding="utf-8") as f:
@@ -143,7 +134,6 @@ class QQRecordPlugin(Star):
             file_stub, name = self._get_file_stub_and_name(event)
 
             log_path = self._data_dir / f"qqrecord-{file_stub}.log"
-            self._rotate_daily(log_path)
             if not log_path.exists():
                 yield event.plain_result(f"未找到日志文件，当前会话：{name}")
                 return
