@@ -1,7 +1,6 @@
 import asyncio
 import os
 import re
-from collections import deque
 from pathlib import Path
 
 from astrbot.api import logger
@@ -20,6 +19,8 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
 class QQRecordPlugin(Star):
     """记录 QQ 群消息到 data/plugin_data/astrbot_plugin_qqrecord。"""
 
+    _SANITIZE_PATTERN = re.compile(r"[^0-9A-Za-z_-]+")
+
     def __init__(self, context: Context):
         super().__init__(context)
         # 数据落盘位置：遵循框架工具方法，避免对目录结构的硬编码。
@@ -28,16 +29,23 @@ class QQRecordPlugin(Star):
 
     def _get_file_stub_and_name(self, event: AstrMessageEvent) -> tuple[str, str]:
         """根据事件类型返回文件后缀与展示名称。"""
-        group = event.message_obj.group
+        try:
+            group = getattr(event.message_obj, "group", None)
+        except AttributeError:
+            group = None
+
         if group:
-            name = group.group_name or group.group_id or "未命名群"
-            file_stub = f"group-{(group.group_id or 'unknown').strip()}"
+            group_id = getattr(group, "group_id", None) or event.get_group_id() or "unknown"
+            group_name = getattr(group, "group_name", None)
+            name = group_name or group_id or "未命名群"
+            file_stub = f"group-{group_id.strip()}"
         else:
             sender_name = (
                 event.get_sender_name() or event.get_sender_id() or "未命名用户"
             )
             name = sender_name
-            file_stub = f"private-{(event.get_sender_id() or 'unknown').strip()}"
+            sender_id = event.get_sender_id() or "unknown"
+            file_stub = f"private-{sender_id.strip()}"
 
         safe_stub = self._sanitize_stub(file_stub)
         return safe_stub, name
@@ -45,7 +53,7 @@ class QQRecordPlugin(Star):
     @staticmethod
     def _sanitize_stub(stub: str) -> str:
         """仅保留字母数字下划线，避免路径遍历，空结果回退 unknown。"""
-        cleaned = re.sub(r"[^0-9A-Za-z_-]+", "_", stub)
+        cleaned = QQRecordPlugin._SANITIZE_PATTERN.sub("_", stub)
         cleaned = cleaned.strip("_-")
         return cleaned or "unknown"
 
@@ -62,12 +70,12 @@ class QQRecordPlugin(Star):
     @staticmethod
     def _tail_lines(path: Path, limit: int, chunk_size: int = 4096) -> list[str]:
         """高效读取文件末尾若干行，避免遍历整文件。"""
-        lines: list[str] = []
+        lines_bytes: list[bytes] = []
         with path.open("rb") as f:
             f.seek(0, os.SEEK_END)
             buffer = b""
             pos = f.tell()
-            while pos > 0 and len(lines) < limit:
+            while pos > 0 and len(lines_bytes) < limit:
                 read_size = chunk_size if pos >= chunk_size else pos
                 pos -= read_size
                 f.seek(pos, os.SEEK_SET)
@@ -76,12 +84,14 @@ class QQRecordPlugin(Star):
                 parts = buffer.split(b"\n")
                 buffer = parts[0]
                 for line in reversed(parts[1:]):
-                    lines.append(line.decode("utf-8", "replace").rstrip("\r"))
-                    if len(lines) >= limit:
+                    lines_bytes.append(line)
+                    if len(lines_bytes) >= limit:
                         break
-            if len(lines) < limit and buffer:
-                lines.append(buffer.decode("utf-8", "replace").rstrip("\r"))
-        return list(reversed(lines[-limit:]))
+            if len(lines_bytes) < limit and buffer:
+                lines_bytes.append(buffer)
+
+        decoded = [lb.decode("utf-8", "replace").rstrip("\r\n") for lb in lines_bytes[-limit:]]
+        return list(reversed(decoded))
 
     async def initialize(self):
         logger.info("QQRecord 插件已初始化，记录路径: %s", self._data_dir)
