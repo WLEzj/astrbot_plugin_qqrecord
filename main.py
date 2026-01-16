@@ -20,6 +20,8 @@ class QQRecordPlugin(Star):
     """记录 QQ 群消息到 data/plugin_data/astrbot_plugin_qqrecord。"""
 
     _SANITIZE_PATTERN = re.compile(r"[^0-9A-Za-z_-]+")
+    _LOG_ENCODING = os.environ.get("QQRECORD_LOG_ENCODING", "utf-8")
+    _LOG_ERRORS = "replace"
 
     def __init__(self, context: Context):
         super().__init__(context)
@@ -37,15 +39,17 @@ class QQRecordPlugin(Star):
         if group:
             group_id = getattr(group, "group_id", None) or event.get_group_id() or "unknown"
             group_name = getattr(group, "group_name", None)
-            name = group_name or group_id or "未命名群"
-            file_stub = f"group-{group_id.strip()}"
+            group_id_str = str(group_id).strip()
+            name = group_name or group_id_str or "未命名群"
+            file_stub = f"group-{group_id_str or 'unknown'}"
         else:
             sender_name = (
                 event.get_sender_name() or event.get_sender_id() or "未命名用户"
             )
             name = sender_name
             sender_id = event.get_sender_id() or "unknown"
-            file_stub = f"private-{sender_id.strip()}"
+            sender_id_str = str(sender_id).strip()
+            file_stub = f"private-{sender_id_str or 'unknown'}"
 
         safe_stub = self._sanitize_stub(file_stub)
         return safe_stub, name
@@ -90,7 +94,10 @@ class QQRecordPlugin(Star):
             if len(lines_bytes) < limit and buffer:
                 lines_bytes.append(buffer)
 
-        decoded = [lb.decode("utf-8", "replace").rstrip("\r\n") for lb in lines_bytes[-limit:]]
+        decoded = [
+            lb.decode(QQRecordPlugin._LOG_ENCODING, QQRecordPlugin._LOG_ERRORS).rstrip("\r\n")
+            for lb in lines_bytes[-limit:]
+        ]
         return list(reversed(decoded))
 
     async def initialize(self):
@@ -114,7 +121,11 @@ class QQRecordPlugin(Star):
             async with self._write_lock:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 is_new_file = not file_path.exists()
-                with file_path.open("a", encoding="utf-8") as f:
+                with file_path.open(
+                    "a",
+                    encoding=QQRecordPlugin._LOG_ENCODING,
+                    errors=QQRecordPlugin._LOG_ERRORS,
+                ) as f:
                     f.write(line + "\n")
                 if is_new_file:
                     self._ensure_secure_permissions(file_path)
