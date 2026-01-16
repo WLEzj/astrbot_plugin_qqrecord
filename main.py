@@ -1,4 +1,7 @@
 import asyncio
+import os
+import re
+from collections import deque
 from pathlib import Path
 
 from astrbot.api import logger
@@ -23,6 +26,39 @@ class QQRecordPlugin(Star):
         self._data_dir = StarTools.get_data_dir("astrbot_plugin_qqrecord")
         self._write_lock = asyncio.Lock()
 
+    def _get_file_stub_and_name(self, event: AstrMessageEvent) -> tuple[str, str]:
+        """根据事件类型返回文件后缀与展示名称。"""
+        group = event.message_obj.group
+        if group:
+            name = group.group_name or group.group_id or "未命名群"
+            file_stub = f"group-{(group.group_id or 'unknown').strip()}"
+        else:
+            sender_name = (
+                event.get_sender_name() or event.get_sender_id() or "未命名用户"
+            )
+            name = sender_name
+            file_stub = f"private-{(event.get_sender_id() or 'unknown').strip()}"
+
+        safe_stub = self._sanitize_stub(file_stub)
+        return safe_stub, name
+
+    @staticmethod
+    def _sanitize_stub(stub: str) -> str:
+        """仅保留字母数字下划线，避免路径遍历，空结果回退 unknown。"""
+        cleaned = re.sub(r"[^0-9A-Za-z_-]+", "_", stub)
+        cleaned = cleaned.strip("_-")
+        return cleaned or "unknown"
+
+    @staticmethod
+    def _ensure_secure_permissions(path: Path) -> None:
+        """在非 Windows 环境下将日志权限收紧为 600，避免泄露。"""
+        if os.name != "nt":
+            try:
+                path.chmod(0o600)
+            except OSError:
+                # 权限收紧失败时记录但不阻断写入。
+                logger.warning("QQRecord 无法设置安全权限: %s", path)
+
     async def initialize(self):
         logger.info("QQRecord 插件已初始化，记录路径: %s", self._data_dir)
 
@@ -43,8 +79,11 @@ class QQRecordPlugin(Star):
         try:
             async with self._write_lock:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
+                is_new_file = not file_path.exists()
                 with file_path.open("a", encoding="utf-8") as f:
                     f.write(line + "\n")
+                if is_new_file:
+                    self._ensure_secure_permissions(file_path)
         except Exception as exc:  # noqa: BLE001 - 需要兜底保护
             logger.warning("QQRecord 写入失败: %s", exc)
 
@@ -57,19 +96,8 @@ class QQRecordPlugin(Star):
         - 私聊：名称为发送者昵称（退化 user_id），文件 qqrecord-private-<user_id>.log。
         """
         try:
-            group = event.message_obj.group
+            file_stub, name = self._get_file_stub_and_name(event)
             content = event.message_str
-
-            if group:
-                name = group.group_name or group.group_id or "未命名群"
-                file_stub = f"group-{(group.group_id or 'unknown').strip()}"
-            else:
-                sender_name = (
-                    event.get_sender_name() or event.get_sender_id() or "未命名用户"
-                )
-                name = sender_name
-                file_stub = f"private-{(event.get_sender_id() or 'unknown').strip()}"
-
             line = self._format_line(content, name)
             await self._write_line(line, file_stub)
         except Exception as exc:  # noqa: BLE001 - 兜底避免插件崩溃
@@ -79,14 +107,7 @@ class QQRecordPlugin(Star):
     async def record_command(self, event: AstrMessageEvent, limit: int = 20):
         """命令 `/record [limit]`：返回当前会话对应日志的最近 N 行。"""
         try:
-            group = event.message_obj.group
-            # 决定读取哪个日志文件（群/私聊）。
-            if group:
-                file_stub = f"group-{(group.group_id or 'unknown').strip()}"
-                name = group.group_name or group.group_id or "未命名群"
-            else:
-                file_stub = f"private-{(event.get_sender_id() or 'unknown').strip()}"
-                name = event.get_sender_name() or event.get_sender_id() or "未命名用户"
+            file_stub, name = self._get_file_stub_and_name(event)
 
             log_path = self._data_dir / f"qqrecord-{file_stub}.log"
             if not log_path.exists():
@@ -95,9 +116,9 @@ class QQRecordPlugin(Star):
 
             # 读取末尾若干行，limit 兜底范围。
             safe_limit = max(1, min(limit, 200))
-            lines: list[str] = []
+            lines = deque(maxlen=safe_limit)
             with log_path.open("r", encoding="utf-8") as f:
-                for line in f.readlines()[-safe_limit:]:
+                for line in f:
                     lines.append(line.rstrip("\n"))
 
             if not lines:
