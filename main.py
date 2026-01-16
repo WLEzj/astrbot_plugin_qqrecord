@@ -1,4 +1,3 @@
-import os
 import json
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +29,9 @@ class QQRecordPlugin(Star):
             return
         
         try:
+            # 获取当前时间（避免多次调用导致的不一致）
+            now = datetime.now()
+            
             # 获取消息信息
             sender_name = event.get_sender_name()
             sender_id = event.sender_id if hasattr(event, 'sender_id') else "unknown"
@@ -43,7 +45,7 @@ class QQRecordPlugin(Star):
             
             # 构建记录数据
             record_data = {
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": now.isoformat(),
                 "session_id": session_id,
                 "sender_id": str(sender_id),
                 "sender_name": sender_name,
@@ -52,7 +54,7 @@ class QQRecordPlugin(Star):
             }
             
             # 按日期分组存储
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = now.strftime("%Y-%m-%d")
             record_file = self.record_dir / f"{today}.jsonl"
             
             # 以追加模式写入记录
