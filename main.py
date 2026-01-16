@@ -4,7 +4,7 @@ from pathlib import Path
 from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.event.filter import EventMessageType, PlatformAdapterType
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
 
@@ -19,14 +19,8 @@ class QQRecordPlugin(Star):
 
     def __init__(self, context: Context):
         super().__init__(context)
-        # 数据落盘位置：统一放在 data/plugin_data 下，避免插件升级被覆盖。
-        # main.py 位于 AstrBot/data/plugins/<plugin>/main.py，因此 parents[2] 指向 AstrBot/data。
-        self._data_dir = (
-            Path(__file__).resolve().parents[2]
-            / "plugin_data"
-            / "astrbot_plugin_qqrecord"
-        )
-        self._data_dir.mkdir(parents=True, exist_ok=True)
+        # 数据落盘位置：遵循框架工具方法，避免对目录结构的硬编码。
+        self._data_dir = StarTools.get_data_dir("astrbot_plugin_qqrecord")
         self._write_lock = asyncio.Lock()
 
     async def initialize(self):
