@@ -1,8 +1,9 @@
 import asyncio
 import re
 import os
-from datetime import datetime
-from collections import defaultdict, deque
+import uuid
+from datetime import datetime, timedelta
+from collections import defaultdict, deque, OrderedDict
 
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
@@ -10,7 +11,7 @@ from astrbot.api.event import filter
 from astrbot.api.event.filter import EventMessageType, PlatformAdapterType
 from astrbot.api.star import Context, Star, register
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
-from astrbot.core.message.components import File
+from astrbot.core.message.components import File, Reply, BaseMessageComponent
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
 
@@ -29,15 +30,35 @@ class QQRecordPlugin(Star):
 
     def __init__(self, context: Context):
         super().__init__(context)
+        # 用于插件KV存储的标识
+        self.plugin_id = "astrbot_plugin_qqrecord"
         self._cache_enabled: bool = True
         self._cache_limit: int = self._DEFAULT_CACHE_LIMIT
+        self._last_seen: dict[str, datetime] = {}
+        self._cleanup_task: asyncio.Task | None = None
+        self._admin_only: bool = False
 
-        # 使用动态工厂方法，确保新会话遵循当前容量
-        def _factory():
-            return deque(maxlen=self._cache_limit)
-
-        self._cache: defaultdict[str, deque[str]] = defaultdict(_factory)
+        # 使用工厂方法确保新会话遵循当前容量（避免 lambda 捕获 self 造成循环引用）
+        self._cache: defaultdict[str, deque[str]] = defaultdict(self._deque_factory(self._cache_limit))
+        # 线程化缓存：按会话维护锚点到线程的数据结构（保持插入有序）
+        self._threads: dict[str, OrderedDict[str, dict]] = {}
         self._write_lock = asyncio.Lock()
+        # 访问统计：按会话记录读取命中/未命中次数
+        self._stats: defaultdict[str, dict[str, int]] = defaultdict(lambda: {"hit": 0, "miss": 0})
+
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        """尝试判断是否管理员；若平台不支持该判断，则默认允许。"""
+        try:
+            # 优先使用事件对象上的权限判断方法（如存在）
+            if hasattr(event, "is_admin"):
+                return bool(event.is_admin())
+            if hasattr(event, "is_group_admin"):
+                return bool(event.is_group_admin())
+            if hasattr(event, "is_super_user"):
+                return bool(event.is_super_user())
+        except Exception:
+            pass
+        return True
 
     def _get_file_stub_and_name(self, event: AstrMessageEvent) -> tuple[str, str]:
         """根据事件类型返回文件后缀与展示名称。"""
@@ -69,11 +90,37 @@ class QQRecordPlugin(Star):
         return cleaned or "unknown"
 
     async def initialize(self):
+        # 从持久化KV恢复配置
+        try:
+            enabled = await self.get_kv_data("cache_enabled", True)
+            if isinstance(enabled, bool):
+                self._cache_enabled = enabled
+            limit = await self.get_kv_data("cache_limit", self._DEFAULT_CACHE_LIMIT)
+            try:
+                limit_int = int(limit) if limit is not None else self._DEFAULT_CACHE_LIMIT
+            except Exception:
+                limit_int = self._DEFAULT_CACHE_LIMIT
+            admin_only = await self.get_kv_data("admin_only", False)
+            try:
+                self._admin_only = bool(admin_only)
+            except Exception:
+                self._admin_only = False
+            # 夹紧范围并应用到现有会话
+            async with self._write_lock:
+                self._reconfigure_cache_limit(max(1, min(limit_int, self._MAX_CACHE_LIMIT)))
+        except Exception as exc:
+            logger.warning("QQRecord 恢复配置失败，使用默认值: %s", exc)
+
         logger.info(
             "QQRecord 插件已初始化，缓存开关=%s，容量：每会话 %s 条",
             self._cache_enabled,
             self._cache_limit,
         )
+        # 启动每日 6 点的清理任务
+        try:
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        except Exception as exc:
+            logger.warning("QQRecord 清理任务启动失败: %s", exc)
 
     def _format_line(self, content: str, group_name: str) -> str:
         """将消息格式化为“内容【群昵称】”行。"""
@@ -88,6 +135,101 @@ class QQRecordPlugin(Star):
             return
         async with self._write_lock:
             self._cache[stub].append(line)
+            self._last_seen[stub] = datetime.now()
+
+    def _get_reply_anchor_id(self, event: AstrMessageEvent) -> tuple[str | int | None, bool]:
+        """从消息链中提取引用锚点 ID。
+
+        返回 (anchor_id, is_reply)。如果不存在 Reply 段，则使用当前消息 ID 作为锚点并标记为非回复。
+        """
+        try:
+            comps: list[BaseMessageComponent] = event.get_messages()
+            for comp in comps:
+                if isinstance(comp, Reply):
+                    return comp.id, True
+        except Exception:
+            pass
+        # 无 Reply 段时，使用自身消息 ID
+        mid = getattr(event.message_obj, "message_id", None)
+        return mid, False
+
+    @staticmethod
+    def _deque_factory(limit: int):
+        return lambda: deque(maxlen=limit)
+
+    def _bump_stat(self, stub: str, hit: bool):
+        stat = self._stats[stub]
+        if hit:
+            stat["hit"] = stat.get("hit", 0) + 1
+        else:
+            stat["miss"] = stat.get("miss", 0) + 1
+
+    def _ensure_threads_session(self, stub: str):
+        if stub not in self._threads:
+            self._threads[stub] = OrderedDict()
+
+    def _enforce_session_capacity(self, stub: str):
+        """确保每会话的总记录条数不超过 _cache_limit（按线程单位裁剪）。"""
+        threads = self._threads.get(stub)
+        if not threads:
+            return
+        def _count():
+            total = 0
+            for entry in threads.values():
+                total += 1 if entry.get("main") else 0
+                total += len(entry.get("replies", []))
+            return total
+        total = _count()
+        while total > self._cache_limit and threads:
+            # 从最早的锚点开始裁剪：优先裁剪其回复，否则移除整个锚点
+            first_key = next(iter(threads.keys()))
+            entry = threads.get(first_key, {})
+            replies = entry.get("replies") or deque()
+            if replies:
+                replies.popleft()
+                entry["replies"] = replies
+            else:
+                threads.pop(first_key, None)
+            total = _count()
+
+    def _write_threaded(self, stub: str, anchor_id: str | int | None, is_reply: bool, line: str):
+        """写入线程化缓存。
+
+        - 无 Reply：作为新的锚点 main 记录。
+        - 有 Reply：追加到对应锚点的 replies。
+        """
+        self._ensure_threads_session(stub)
+        threads = self._threads[stub]
+        key = str(anchor_id) if anchor_id is not None else f"auto-{int(datetime.now().timestamp())}"
+        if key not in threads:
+            threads[key] = {"main": None, "replies": deque(), "first_ts": datetime.now(), "last_ts": None}
+        entry = threads[key]
+        if is_reply:
+            entry["replies"].append(line)
+            entry["last_ts"] = datetime.now()
+            try:
+                logger.info("QQRecord 追加回复：会话=%s，锚点=%s，累计=%d", stub, key, len(entry["replies"]))
+            except Exception:
+                pass
+        else:
+            if entry.get("main") is None:
+                entry["main"] = line
+                entry["last_ts"] = datetime.now()
+                try:
+                    logger.info("QQRecord 新建线程主消息：会话=%s，锚点=%s", stub, key)
+                except Exception:
+                    pass
+            else:
+                # 若主消息已存在，再追加同一锚点的后续文本为回复
+                entry["replies"].append(line)
+                entry["last_ts"] = datetime.now()
+                try:
+                    logger.info("QQRecord 主消息后续作为回复：会话=%s，锚点=%s，累计=%d", stub, key, len(entry["replies"]))
+                except Exception:
+                    pass
+        # 更新活跃时间与裁剪
+        self._last_seen[stub] = datetime.now()
+        self._enforce_session_capacity(stub)
 
     async def _send_cache_as_file(
         self,
@@ -107,8 +249,9 @@ class QQRecordPlugin(Star):
             return
 
         safe_stub = (file_stub or "unknown").strip()
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        fname = f"qqrecord-{safe_stub}-{ts}.txt"
+        now = datetime.now()
+        ts = now.strftime("%Y%m%d-%H%M%S-%f")
+        fname = f"qqrecord-{safe_stub}-{ts}-{uuid.uuid4().hex[:6]}.txt"
         temp_dir = get_astrbot_temp_path()
         os.makedirs(temp_dir, exist_ok=True)
         fpath = os.path.join(temp_dir, fname)
@@ -122,9 +265,10 @@ class QQRecordPlugin(Star):
                 MessageChain(chain=[File(name=fname, file=fpath)])
             )
         except Exception as exc:
-            logger.warning("QQRecord 文件发送失败: %s", exc)
-            await event.send(
-                MessageChain(chain=["记录文件生成或发送失败，请稍后重试。"])
+            logger.warning("QQRecord 文件发送失败，回退为文本：%s", exc)
+            await self._send_text_segments(
+                event,
+                f"记录文件发送失败（可能未配置回调地址或平台不支持文件），改为文本：\n{content}"
             )
         finally:
             try:
@@ -148,9 +292,64 @@ class QQRecordPlugin(Star):
             file_stub, name = self._get_file_stub_and_name(event)
             content = event.message_str
             line = self._format_line(content, name)
-            await self._write_line(line, file_stub)
+            # 线程化写入（按 Reply 锚点归类）
+            anchor_id, is_reply = self._get_reply_anchor_id(event)
+            async with self._write_lock:
+                self._write_threaded(file_stub, anchor_id, is_reply, line)
+                # 兼容旧缓存结构（用于现有测试/简单读取）
+                self._cache[file_stub].append(line)
         except Exception as exc:  # noqa: BLE001 - 兜底避免插件崩溃
             logger.warning("QQRecord 处理消息失败: %s", exc)
+
+    def _seconds_until_next_6am(self) -> float:
+        now = datetime.now()
+        next_run = now.replace(hour=6, minute=0, second=0, microsecond=0)
+        if now >= next_run:
+            next_run += timedelta(days=1)
+        return max(1.0, (next_run - now).total_seconds())
+
+    async def _cleanup_loop(self):
+        while True:
+            try:
+                delay = self._seconds_until_next_6am()
+                await asyncio.sleep(delay)
+                await self._cleanup_inactive(max_age_hours=24)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("QQRecord 清理循环异常: %s", exc)
+
+    async def _cleanup_inactive(self, max_age_hours: int = 24):
+        """清理长时间未更新的会话缓存键，默认 24 小时未活动即清理。"""
+        cutoff = datetime.now() - timedelta(hours=max_age_hours)
+        removed = 0
+        removed_keys: list[str] = []
+        async with self._write_lock:
+            for key in list(self._cache.keys()):
+                last = self._last_seen.get(key)
+                if last is None or last < cutoff:
+                    try:
+                        self._cache.pop(key, None)
+                        self._last_seen.pop(key, None)
+                        removed += 1
+                        removed_keys.append(key)
+                    except Exception:
+                        pass
+        if removed:
+            try:
+                preview = ", ".join(removed_keys[:10])
+                more = "..." if len(removed_keys) > 10 else ""
+                now = datetime.now()
+                next_run = now.replace(hour=6, minute=0, second=0, microsecond=0)
+                if now >= next_run:
+                    next_run += timedelta(days=1)
+                next_str = next_run.strftime("%Y-%m-%d %H:%M:%S")
+                logger.info(
+                    "QQRecord 每日清理完成：移除不活跃会话 %s 项（阈值 %s 小时）。示例：%s%s；下次预计 %s 运行",
+                    removed, max_age_hours, preview, more, next_str
+                )
+            except Exception:
+                logger.info("QQRecord 每日清理完成：移除不活跃会话 %s 项（阈值 %s 小时）", removed, max_age_hours)
 
     @filter.command("record")
     async def record_command(self, event: AstrMessageEvent, limit: int = 10):
@@ -160,47 +359,147 @@ class QQRecordPlugin(Star):
             if not self._cache_enabled:
                 yield event.plain_result("缓存未启用，请先 /record_cache on")
                 return
-
             safe_limit = max(1, min(limit, self._cache_limit))
             async with self._write_lock:
-                lines = list(self._cache.get(file_stub, []))[-safe_limit:]
+                # 展平线程：按锚点插入顺序输出 main + replies
+                lines = []
+                threads = self._threads.get(file_stub, OrderedDict())
+                for entry in threads.values():
+                    if entry.get("main"):
+                        lines.append(entry["main"])
+                    lines.extend(list(entry.get("replies", [])))
+                lines = lines[-safe_limit:]
 
             if not lines:
                 yield event.plain_result(f"缓存为空，当前会话：{name}")
+                self._bump_stat(file_stub, False)
                 return
 
+            self._bump_stat(file_stub, True)
             preview = "\n".join(lines)
             yield event.plain_result(f"最近 {len(lines)} 条缓存记录（{name}）：\n{preview}")
         except Exception as exc:  # noqa: BLE001
             logger.warning("QQRecord /record 命令失败: %s", exc)
             yield event.plain_result("读取记录时出现错误，请稍后重试。")
 
+    @filter.command("record_thread")
+    async def record_thread_command(self, event: AstrMessageEvent, anchor_id: str, limit: int | None = None):
+        """命令 `/record_thread <anchor_id> [limit]`：按锚点查看该线程内容。"""
+        try:
+            file_stub, name = self._get_file_stub_and_name(event)
+            key = str(anchor_id).strip()
+            async with self._write_lock:
+                threads = self._threads.get(file_stub, OrderedDict())
+                entry = threads.get(key)
+                if not entry:
+                    yield event.plain_result(f"未找到锚点 {key} 的线程（{name}）。")
+                    return
+                lines: list[str] = []
+                if entry.get("main"):
+                    lines.append(entry["main"])
+                lines.extend(list(entry.get("replies", [])))
+                if isinstance(limit, int) and limit > 0:
+                    lines = lines[-limit:]
+
+            if not lines:
+                yield event.plain_result(f"该线程暂无记录（{name}）。")
+                self._bump_stat(file_stub, False)
+                return
+
+            self._bump_stat(file_stub, True)
+            preview = "\n".join(lines)
+            yield event.plain_result(f"线程 {key} 最近 {len(lines)} 条（{name}）：\n{preview}")
+        except Exception as exc:
+            logger.warning("QQRecord /record_thread 命令失败: %s", exc)
+            yield event.plain_result("读取线程记录时出现错误，请稍后重试。")
+
+    @filter.command("record_threads")
+    async def record_threads_command(self, event: AstrMessageEvent, limit: int = 10):
+        """命令 `/record_threads [limit]`：列出最近的线程摘要。"""
+        try:
+            file_stub, name = self._get_file_stub_and_name(event)
+            async with self._write_lock:
+                threads = self._threads.get(file_stub, OrderedDict())
+                # 取最后 limit 个锚点摘要（保持插入顺序）
+                items = list(threads.items())[-max(1, limit):]
+            if not items:
+                yield event.plain_result(f"当前会话暂无线程（{name}）。")
+                self._bump_stat(file_stub, False)
+                return
+
+            def _short(s: str, n: int = 40) -> str:
+                s = (s or "").strip()
+                return s if len(s) <= n else s[:n] + "…"
+
+            lines = []
+            for key, entry in items:
+                main = entry.get("main") or "(无主消息)"
+                cnt = 1 if entry.get("main") else 0
+                cnt += len(entry.get("replies", []))
+                ts = entry.get("last_ts") or entry.get("first_ts")
+                ts_str = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "-"
+                lines.append(f"anchor={key} | count={cnt} | last={ts_str} | main={_short(main)}")
+
+            self._bump_stat(file_stub, True)
+            preview = "\n".join(lines)
+            tip = "\n提示：使用 /record_thread <anchor_id> 查看该线程详情。"
+            yield event.plain_result(f"最近 {len(items)} 个线程摘要（{name}）：\n{preview}{tip}")
+        except Exception as exc:
+            logger.warning("QQRecord /record_threads 命令失败: %s", exc)
+            yield event.plain_result("列出线程摘要时出现错误，请稍后重试。")
+
     @filter.command("record_file")
-    async def record_file_command(self, event: AstrMessageEvent, limit: int = 10):
-        """命令 `/record_file [limit]`：将最近 N 行记录打包为文本文件并发送。"""
+    async def record_file_command(self, event: AstrMessageEvent, limit: int = 10, fmt: str | None = None):
+        """命令 `/record_file [limit] [fmt]`：将最近 N 行记录导出。
+
+        - `fmt` 可选：`txt`（默认）或 `md`。当文件发送失败时，自动退化为分段文本消息。
+        """
         try:
             file_stub, name = self._get_file_stub_and_name(event)
             if not self._cache_enabled:
                 await event.send(MessageChain(chain=["缓存未启用，请先 /record_cache on"]))
                 return
-
             safe_limit = max(1, min(limit, self._cache_limit))
             async with self._write_lock:
-                lines = list(self._cache.get(file_stub, []))[-safe_limit:]
+                lines = []
+                threads = self._threads.get(file_stub, OrderedDict())
+                for entry in threads.values():
+                    if entry.get("main"):
+                        lines.append(entry["main"])
+                    lines.extend(list(entry.get("replies", [])))
+                lines = lines[-safe_limit:]
+
+            # 根据格式简单适配内容（md 与 txt 目前仅在标题/分隔上有轻度差异）
+            if fmt and str(fmt).lower() == "md":
+                # 为 markdown 添加标题与分隔
+                lines = [f"# 记录（{name}）", "", *lines]
 
             await self._send_cache_as_file(event, lines, name, file_stub)
+            self._bump_stat(file_stub, bool(lines))
         except Exception as exc:  # noqa: BLE001
             logger.warning("QQRecord /record_file 命令失败: %s", exc)
-            await event.send(
-                MessageChain(chain=["导出记录为文件时出现错误，请稍后重试。"])
-            )
+            # 发送失败时退化为分段文本消息
+            try:
+                file_stub, name = self._get_file_stub_and_name(event)
+                async with self._write_lock:
+                    lines = []
+                    threads = self._threads.get(file_stub, OrderedDict())
+                    for entry in threads.values():
+                        if entry.get("main"):
+                            lines.append(entry["main"])
+                        lines.extend(list(entry.get("replies", [])))
+                content = "\n".join(lines[-max(1, min(limit, self._cache_limit)):])
+                await self._send_text_segments(event, f"记录文件发送失败，改为文本：\n{content}")
+                self._bump_stat(file_stub, bool(lines))
+            except Exception:
+                await event.send(MessageChain(chain=["导出记录为文件时出现错误，请稍后重试。"]))
 
     def _reconfigure_cache_limit(self, new_limit: int):
         """调整所有会话缓存容量，保留最近 new_limit 条内容。"""
         new_limit = max(1, min(new_limit, self._MAX_CACHE_LIMIT))
         self._cache_limit = new_limit
         # 更新默认工厂
-        self._cache.default_factory = lambda: deque(maxlen=self._cache_limit)
+        self._cache.default_factory = self._deque_factory(self._cache_limit)
 
         # 重建已有 deque，保留尾部
         for key, dq in list(self._cache.items()):
@@ -209,19 +508,51 @@ class QQRecordPlugin(Star):
 
     @filter.command("record_cache")
     async def record_cache_command(self, event: AstrMessageEvent, flag: str | None = None):
-        """命令 `/record_cache [on|off]`：开启/关闭缓存写入；不带参数则查询状态。"""
+        """命令 `/record_cache [on|off|status]`：开启/关闭/查询状态。仅管理员可调。"""
         try:
+            if self._admin_only and not self._is_admin(event):
+                yield event.plain_result("仅管理员可用该命令。")
+                return
             if flag is None:
                 state = "on" if self._cache_enabled else "off"
                 yield event.plain_result(f"缓存状态：{state}，容量：每会话 {self._cache_limit} 条")
                 return
 
             val = str(flag).strip().lower()
+            if val == "status":
+                # 输出更详尽状态
+                file_stub, name = self._get_file_stub_and_name(event)
+                async with self._write_lock:
+                    session_lines = len(self._cache.get(file_stub, []))
+                    threads_cnt = len(self._threads.get(file_stub, OrderedDict()))
+                    total_sessions = len(self._cache.keys())
+                    stat = self._stats.get(file_stub, {"hit": 0, "miss": 0})
+                hit = stat.get("hit", 0)
+                miss = stat.get("miss", 0)
+                total_req = hit + miss
+                hit_rate = (hit / total_req * 100) if total_req else 0.0
+                yield event.plain_result(
+                    f"状态：{'开启' if self._cache_enabled else '关闭'}\n"
+                    f"容量上限：{self._cache_limit}\n"
+                    f"当前会话（{name}）：行数={session_lines}，线程数={threads_cnt}\n"
+                    f"命中：{hit}，未命中：{miss}，命中率：{hit_rate:.1f}%\n"
+                    f"总会话键数：{total_sessions}"
+                )
+                return
             if val in ("on", "true", "1"):
                 self._cache_enabled = True
+                # 持久化
+                try:
+                    await self.put_kv_data("cache_enabled", True)
+                except Exception:
+                    pass
                 yield event.plain_result("已开启缓存写入。")
             elif val in ("off", "false", "0"):
                 self._cache_enabled = False
+                try:
+                    await self.put_kv_data("cache_enabled", False)
+                except Exception:
+                    pass
                 yield event.plain_result("已关闭缓存写入。")
             else:
                 yield event.plain_result("参数无效，请使用 /record_cache on 或 /record_cache off")
@@ -231,16 +562,39 @@ class QQRecordPlugin(Star):
 
     @filter.command("record_limit")
     async def record_limit_command(self, event: AstrMessageEvent, n: int | None = None):
-        """命令 `/record_limit [n]`：设置/查询每会话缓存上限，范围 1~5000。"""
+        """命令 `/record_limit [n]`：设置/查询每会话缓存上限，范围 1~5000。仅管理员可调。"""
         try:
+            if self._admin_only and not self._is_admin(event):
+                yield event.plain_result("仅管理员可用该命令。")
+                return
             if n is None:
+                # 无参时输出更详尽状态
+                file_stub, name = self._get_file_stub_and_name(event)
+                async with self._write_lock:
+                    session_lines = len(self._cache.get(file_stub, []))
+                    threads_cnt = len(self._threads.get(file_stub, OrderedDict()))
+                    stat = self._stats.get(file_stub, {"hit": 0, "miss": 0})
+                    total_sessions = len(self._cache.keys())
+                hit = stat.get("hit", 0)
+                miss = stat.get("miss", 0)
+                total_req = hit + miss
+                hit_rate = (hit / total_req * 100) if total_req else 0.0
                 yield event.plain_result(
-                    f"当前容量上限：每会话 {self._cache_limit} 条（可设置范围 1~{self._MAX_CACHE_LIMIT}）"
+                    f"当前容量上限：每会话 {self._cache_limit} 条（可设置范围 1~{self._MAX_CACHE_LIMIT}）\n"
+                    f"当前会话（{name}）：行数={session_lines}，线程数={threads_cnt}\n"
+                    f"命中：{hit}，未命中：{miss}，命中率：{hit_rate:.1f}%\n"
+                    f"总会话键数：{total_sessions}"
                 )
                 return
 
             async with self._write_lock:
                 self._reconfigure_cache_limit(int(n))
+
+            # 持久化
+            try:
+                await self.put_kv_data("cache_limit", int(self._cache_limit))
+            except Exception:
+                pass
 
             yield event.plain_result(
                 f"已将容量上限设为：每会话 {self._cache_limit} 条，现有会话已按新上限裁剪"
@@ -250,4 +604,22 @@ class QQRecordPlugin(Star):
             yield event.plain_result("调整容量上限时出现错误，请稍后重试。")
 
     async def terminate(self):
+        # 停止清理任务
+        try:
+            if self._cleanup_task:
+                self._cleanup_task.cancel()
+        except Exception:
+            pass
         logger.info("QQRecord 插件已卸载。")
+
+    async def _send_text_segments(self, event: AstrMessageEvent, content: str, segment_len: int = 1000):
+        """将长文本按段发送，避免平台消息长度限制。"""
+        try:
+            text = content or ""
+            if not text:
+                return
+            segments = [text[i:i+segment_len] for i in range(0, len(text), segment_len)]
+            for seg in segments:
+                await event.send(MessageChain(chain=[seg]))
+        except Exception as exc:
+            logger.warning("QQRecord 文本分段发送失败: %s", exc)
