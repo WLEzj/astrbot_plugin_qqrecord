@@ -17,11 +17,11 @@ from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
 
 class QQRecordPlugin(Star):
-    """记录 QQ 会话消息到内存缓存（默认每会话最近 1000 条）。"""
+    """记录 QQ 会话消息到内存缓存（默认每会话最近 500 条）。"""
 
     _SANITIZE_PATTERN = re.compile(r"[^0-9A-Za-z_-]+")
-    _default_cache_limit = 1000
-    _max_cache_limit = 5000
+    _default_cache_limit = 500
+    _max_cache_limit = 1000
     _default_cleanup_hours = 24
     _default_segment_len = 1000
     _default_segment_delay = 0.5
