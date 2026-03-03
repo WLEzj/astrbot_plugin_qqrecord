@@ -370,6 +370,16 @@ class CleanupScheduler:
             next_run += timedelta(days=1)
         return max(1.0, (next_run - now).total_seconds())
 
+    async def run_once(self, *, max_age_hours: int, temp_cleanup_hours: int):
+        await self.cleanup_inactive(max_age_hours=max_age_hours)
+        await self.cleanup_temp_files(max_age_hours=temp_cleanup_hours)
+
+    async def run_loop(self, *, max_age_hours: int, temp_cleanup_hours: int):
+        await self._cleanup_loop(
+            max_age_hours=max_age_hours,
+            temp_cleanup_hours=temp_cleanup_hours,
+        )
+
     async def _cleanup_loop(self, *, max_age_hours: int, temp_cleanup_hours: int):
         failures = 0
         while True:
@@ -509,6 +519,7 @@ class QQRecordPlugin(Star):
     MAX_CACHE_LIMIT = 1000
     DEFAULT_CLEANUP_HOURS = 24
     DEFAULT_SEGMENT_LEN = 1000
+    MAX_URL_LEN = 500
     DEFAULT_SEGMENT_DELAY = 0.5
     TEMP_FILE_PREFIX = "qqrecord-"
     TEMP_CLEANUP_HOURS = 24
@@ -584,14 +595,40 @@ class QQRecordPlugin(Star):
             self._log_debug_exception("QQRecord 管理员判断异常", exc)
         return False
 
-    @staticmethod
-    def _admin_check_notice() -> str:
-        return "平台不支持管理员判断时会默认拒绝。"
-
-    def _admin_denied_message(self, event: AstrMessageEvent, required: bool, base_message: str) -> str | None:
-        if required and not self._is_admin(event):
-            return f"{base_message}{self._admin_check_notice()}"
-        return None
+    def _admin_denied_message(self, event: AstrMessageEvent, base_message: str) -> str | None:
+        """检查管理员权限，返回拒绝消息或None。
+        
+        区分两种场景：
+        1. 能判断且非管理员：返回"权限不足"
+        2. 无法判断管理员身份：返回"平台不支持管理员判断，默认拒绝"
+        """
+        try:
+            # 尝试判断管理员身份
+            is_admin = False
+            admin_check_available = False
+            
+            if hasattr(event, "is_admin"):
+                is_admin = bool(event.is_admin())
+                admin_check_available = True
+            elif hasattr(event, "is_group_admin"):
+                is_admin = bool(event.is_group_admin())
+                admin_check_available = True
+            elif hasattr(event, "is_super_user"):
+                is_admin = bool(event.is_super_user())
+                admin_check_available = True
+            
+            if admin_check_available:
+                # 能判断管理员身份
+                if not is_admin:
+                    return f"{base_message}"
+                return None
+            else:
+                # 无法判断管理员身份
+                return f"平台不支持管理员判断，默认拒绝。"
+                
+        except (AttributeError, TypeError, RuntimeError) as exc:
+            self._log_debug_exception("QQRecord 管理员判断异常", exc)
+            return f"平台不支持管理员判断，默认拒绝。"
 
     def _cache_disabled_message(self) -> str:
         return "缓存未启用，请先 /record_cache on"
@@ -844,7 +881,7 @@ class QQRecordPlugin(Star):
         return self._cleanup_scheduler.seconds_until_next_6am()
 
     async def _cleanup_loop(self):
-        await self._cleanup_scheduler._cleanup_loop(
+        await self._cleanup_scheduler.run_loop(
             max_age_hours=self.DEFAULT_CLEANUP_HOURS,
             temp_cleanup_hours=self.TEMP_CLEANUP_HOURS,
         )
@@ -860,14 +897,15 @@ class QQRecordPlugin(Star):
     async def record_command(self, event: AstrMessageEvent, limit: int = 10):
         """命令 `/record [limit]`：返回当前会话内存缓存的最近 N 行。"""
         try:
-            denied = self._admin_denied_message(
-                event,
-                self._export_admin_only,
-                "仅管理员可导出记录。",
-            )
-            if denied:
-                yield event.plain_result(denied)
-                return
+            # 检查导出权限设置
+            if self._export_admin_only:
+                denied = self._admin_denied_message(
+                    event,
+                    "仅管理员可导出记录。",
+                )
+                if denied:
+                    yield event.plain_result(denied)
+                    return
             file_stub, name = self._get_file_stub_and_name(event)
             if not self._cache_enabled:
                 yield event.plain_result(self._cache_disabled_message())
@@ -878,6 +916,7 @@ class QQRecordPlugin(Star):
                 lines = lines[-safe_limit:]
 
             if not lines:
+                self._bump_stat(file_stub, False)
                 yield event.plain_result(f"缓存为空，当前会话：{name}")
                 return
 
@@ -946,6 +985,7 @@ class QQRecordPlugin(Star):
                     reverse=True,
                 )[: max(1, limit)]
             if not items:
+                self._bump_stat(file_stub, False)
                 yield event.plain_result(f"当前会话暂无线程（{name}）。")
                 return
 
@@ -988,14 +1028,15 @@ class QQRecordPlugin(Star):
         fmt: str | None = None,
     ):
         try:
-            denied = self._admin_denied_message(
-                event,
-                self._export_admin_only,
-                "仅管理员可导出记录。",
-            )
-            if denied:
-                yield event.plain_result(denied)
-                return
+            # 检查导出权限设置
+            if self._export_admin_only:
+                denied = self._admin_denied_message(
+                    event,
+                    "仅管理员可导出记录。",
+                )
+                if denied:
+                    yield event.plain_result(denied)
+                    return
             file_stub, name = self._get_file_stub_and_name(event)
             if not self._cache_enabled:
                 yield event.plain_result(self._cache_disabled_message())
@@ -1059,7 +1100,6 @@ class QQRecordPlugin(Star):
         try:
             denied = self._admin_denied_message(
                 event,
-                self._admin_only,
                 "仅管理员可用该命令。",
             )
             if denied:
@@ -1137,7 +1177,6 @@ class QQRecordPlugin(Star):
         try:
             denied = self._admin_denied_message(
                 event,
-                True,
                 "仅管理员可用该命令。",
             )
             if denied:
@@ -1181,7 +1220,6 @@ class QQRecordPlugin(Star):
         try:
             denied = self._admin_denied_message(
                 event,
-                self._admin_only,
                 "仅管理员可用该命令。",
             )
             if denied:
@@ -1283,7 +1321,7 @@ class QQRecordPlugin(Star):
             is_url = bool(QQRecordPlugin.URL_PATTERN.fullmatch(tok.strip()))
             if len(tok) > limit:
                 flush_buffer()
-                if is_url:
+                if is_url and len(tok) <= QQRecordPlugin.MAX_URL_LEN:
                     segments.append(tok)
                 else:
                     segments.extend(
