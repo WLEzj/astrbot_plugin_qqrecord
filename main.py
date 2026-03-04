@@ -5,8 +5,7 @@ import itertools
 from datetime import datetime, timedelta
 from collections import OrderedDict
 
-from astrbot.api import logger, sp
-from astrbot.api.event import MessageChain
+from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.event.filter import EventMessageType, PlatformAdapterType
 from astrbot.api.star import Context, Star
@@ -80,13 +79,14 @@ class QQRecordPlugin(Star):
             cleanup_backoff_seconds=self.DEFAULT_CLEANUP_BACKOFF_SECONDS,
             cleanup_backoff_max_seconds=self.DEFAULT_CLEANUP_BACKOFF_MAX_SECONDS,
             log_debug_exception=self._log_debug_exception,
+            write_lock=self._write_lock,
         )
 
         self._record_commands = RecordCommands(self)
         self._thread_commands = ThreadCommands(self)
         self._admin_commands = AdminCommands(self)
 
-    async def _get_plugin_id(self) -> str:
+    def _get_plugin_id(self) -> str:
         return getattr(self, "plugin_id", "astrbot_plugin_qqrecord")
 
     def _log_debug_exception(self, msg: str, exc: Exception, **kwargs):
@@ -118,9 +118,63 @@ class QQRecordPlugin(Star):
     async def _put_kv_value(self, key: str, value):
         await self._config_store.put(key, value)
 
+    async def _cleanup_inactive(self, max_age_hours: int = 24):
+        """清理不活跃的会话记录"""
+        async with self._write_lock:
+            # 直接执行清理逻辑，避免嵌套异步函数
+            cutoff = datetime.now() - timedelta(hours=max_age_hours)
+            removed = 0
+            removed_keys: list[str] = []
+            
+            for key in sorted(self._thread_cache.all_session_keys()):
+                last = self._thread_cache.last_seen.get(key)
+                if last is None or last < cutoff:
+                    try:
+                        self._thread_cache.last_seen.pop(key, None)
+                        self._thread_cache.threads.pop(key, None)
+                        self._thread_cache.stats_tracker.stats.pop(key, None)
+                        removed += 1
+                        removed_keys.append(key)
+                    except Exception as exc:
+                        self._log_debug_exception(
+                            "QQRecord 清理会话失败",
+                            exc,
+                            stub=key,
+                        )
+            
+            if removed:
+                try:
+                    preview = ", ".join(removed_keys[: self._cleanup_scheduler._cleanup_preview_limit])
+                    more = "..." if len(removed_keys) > self._cleanup_scheduler._cleanup_preview_limit else ""
+                    now = datetime.now()
+                    next_run = now.replace(
+                        hour=self._cleanup_scheduler._cleanup_hour,
+                        minute=self._cleanup_scheduler._cleanup_minute,
+                        second=0,
+                        microsecond=0,
+                    )
+                    if now >= next_run:
+                        next_run += timedelta(days=1)
+                    next_str = next_run.strftime("%Y-%m-%d %H:%M:%S")
+                    logger.info(
+                        "QQRecord 每日清理完成：移除不活跃会话 %s 项（阈值 %s 小时）。"
+                        "示例：%s%s；下次预计 %s 运行",
+                        removed,
+                        max_age_hours,
+                        preview,
+                        more,
+                        next_str,
+                    )
+                except Exception:
+                    logger.info(
+                        "QQRecord 每日清理完成：移除不活跃会话 %s 项（阈值 %s 小时）",
+                        removed,
+                        max_age_hours,
+                    )
+
     async def _load_settings(self):
         self._cache_enabled = await self._get_kv_value("cache_enabled", True)
-        self._cache_limit = await self._get_kv_value("cache_limit", self.DEFAULT_CACHE_LIMIT)
+        self._cache_limit = self._clamp_limit(await self._get_kv_value("cache_limit", self.DEFAULT_CACHE_LIMIT))
         self._admin_only = await self._get_kv_value("admin_only", False)
         self._export_admin_only = await self._get_kv_value("export_admin_only", True)
         self._record_private_chats = await self._get_kv_value("record_private_chats", False)
@@ -141,39 +195,61 @@ class QQRecordPlugin(Star):
             new_limit = self.MAX_CACHE_LIMIT
         self._cache_limit = new_limit
         for stub, threads in self._thread_cache.threads.items():
-            for key, entry in threads.items():
-                while len(entry.replies) > self._cache_limit:
-                    entry.replies.popleft()
+            self._thread_cache.enforce_session_capacity(stub, self._cache_limit)
 
     def _get_file_stub_and_name(self, event: AstrMessageEvent) -> tuple[str, str]:
         session = event.session
         if not session:
             return ("unknown", "未知会话")
-        session_id = session.session_id
-        platform = session.adapter_type
+        
+        try:
+            platform = session.adapter_type
+        except AttributeError:
+            # 处理测试环境或其他情况下缺少 adapter_type 的情况
+            return ("unknown", "未知会话")
+        
         if platform == PlatformAdapterType.onebot:
-            group_id = session.group_id
-            user_id = session.user_id
-            if group_id:
-                return (f"qq_group_{group_id}", f"QQ群 {group_id}")
-            else:
-                return (f"qq_private_{user_id}", f"QQ私聊 {user_id}")
+            try:
+                group_id = session.group_id
+                user_id = session.user_id
+                if group_id:
+                    return (f"qq_group_{group_id}", f"QQ群 {group_id}")
+                else:
+                    return (f"qq_private_{user_id}", f"QQ私聊 {user_id}")
+            except AttributeError:
+                # 处理缺少 group_id 或 user_id 的情况
+                return ("unknown", "未知会话")
         else:
-            return (f"{platform.value}_{session_id}", f"{platform.value}会话 {session_id}")
+            try:
+                session_id = session.session_id
+                return (f"{platform.value}_{session_id}", f"{platform.value}会话 {session_id}")
+            except AttributeError:
+                # 处理缺少 session_id 或 platform.value 的情况
+                return ("unknown", "未知会话")
 
     def _should_record_message(self, event: AstrMessageEvent) -> bool:
         session = event.session
         if not session:
             return False
-        platform = session.adapter_type
+        
+        try:
+            platform = session.adapter_type
+        except AttributeError:
+            # 处理测试环境或其他情况下缺少 adapter_type 的情况
+            return True
+        
         if platform == PlatformAdapterType.onebot:
-            group_id = session.group_id
-            if group_id:
-                if self._group_whitelist:
-                    return str(group_id) in self._group_whitelist
+            try:
+                group_id = session.group_id
+                if group_id:
+                    if self._group_whitelist:
+                        return str(group_id) in self._group_whitelist
+                    return True
+                else:
+                    return self._record_private_chats
+            except AttributeError:
+                # 处理缺少 group_id 的情况
                 return True
-            else:
-                return self._record_private_chats
         return True
 
     def _sanitize_message(self, content: str) -> str:
@@ -290,12 +366,18 @@ class QQRecordPlugin(Star):
             if not session:
                 return
             file_stub, _ = self._get_file_stub_and_name(event)
-            message_chain = event.message
-            if not message_chain:
+            
+            try:
+                message_chain = event.message
+                if not message_chain:
+                    return
+                components = message_chain.chain
+                if not components:
+                    return
+            except AttributeError:
+                # 处理测试环境或其他情况下缺少 message 属性的情况
                 return
-            components = message_chain.chain
-            if not components:
-                return
+            
             text_parts: list[str] = []
             for comp in components:
                 if isinstance(comp, str):

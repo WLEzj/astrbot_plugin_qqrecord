@@ -5,7 +5,6 @@ import asyncio
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
 from astrbot.core.message.components import File
-from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
 
 class Exporter:
@@ -45,8 +44,7 @@ class Exporter:
             return
 
         safe_stub = (file_stub or "unknown").strip()
-        now = asyncio.get_event_loop().time()
-        ts = asyncio.get_event_loop().time()
+        ts = asyncio.get_running_loop().time()
         fname = f"{self._temp_file_prefix}{safe_stub}-{ts}-{uuid.uuid4().hex}.txt"
         temp_dir = self._temp_dir_provider()
         os.makedirs(temp_dir, exist_ok=True)

@@ -17,7 +17,7 @@ class ThreadEntry:
 
 class StatsTracker:
     def __init__(self):
-        self._stats: dict[str, dict[str, int]] = {"hit": 0, "miss": 0}
+        self._stats: dict[str, dict[str, int]] = {}
 
     @property
     def stats(self) -> dict[str, dict[str, int]]:
@@ -206,3 +206,19 @@ class ThreadCache:
 
     def all_session_keys(self) -> set[str]:
         return set(self.threads.keys()) | set(self.last_seen.keys())
+
+    def add_message(self, stub: str, content: str, timestamp: datetime, reply_component):
+        """添加消息到缓存"""
+        anchor_id = None
+        is_reply = False
+        if reply_component:
+            anchor_id = getattr(reply_component, "id", None)
+            is_reply = True
+        self.write_threaded(
+            stub=stub,
+            anchor_id=anchor_id,
+            is_reply=is_reply,
+            line=content,
+            cache_limit=500,
+            max_sessions=500,
+        )

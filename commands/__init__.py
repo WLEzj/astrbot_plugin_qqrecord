@@ -3,7 +3,7 @@ from .thread import ThreadCommands
 from .admin import AdminCommands
 
 __all__ = [
-    'RecordCommands',
-    'ThreadCommands',
-    'AdminCommands',
+    "RecordCommands",
+    "ThreadCommands",
+    "AdminCommands",
 ]

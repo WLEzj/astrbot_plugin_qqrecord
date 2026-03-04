@@ -27,7 +27,7 @@ class ThreadCommands:
                 return
             key = str(anchor_id).strip()
             async with self._plugin._write_lock:
-                threads = self._plugin._threads.get(file_stub, OrderedDict())
+                threads = self._plugin._thread_cache.threads.get(file_stub, OrderedDict())
                 entry = threads.get(key)
                 if not entry:
                     yield event.plain_result(f"未找到锚点 {key} 的线程（{name}）。")
@@ -71,13 +71,14 @@ class ThreadCommands:
             if not self._plugin._cache_enabled:
                 yield event.plain_result(self._plugin._cache_disabled_message())
                 return
+            safe_limit = max(1, min(limit, 100))
             async with self._plugin._write_lock:
-                threads = self._plugin._threads.get(file_stub, OrderedDict())
+                threads = self._plugin._thread_cache.threads.get(file_stub, OrderedDict())
                 items = sorted(
                     threads.items(),
                     key=lambda item: item[1].last_ts or item[1].first_ts or datetime.min,
                     reverse=True,
-                )[: max(1, limit)]
+                )[:safe_limit]
             if not items:
                 self._plugin._bump_stat(file_stub, False)
                 yield event.plain_result(f"当前会话暂无线程（{name}）。")

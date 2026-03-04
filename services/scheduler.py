@@ -19,6 +19,7 @@ class CleanupScheduler:
         cleanup_backoff_seconds: int,
         cleanup_backoff_max_seconds: int,
         log_debug_exception,
+        write_lock=None,
     ):
         self._thread_cache = thread_cache
         self._is_safe_path = is_safe_path
@@ -30,6 +31,7 @@ class CleanupScheduler:
         self._cleanup_backoff_seconds = cleanup_backoff_seconds
         self._cleanup_backoff_max_seconds = cleanup_backoff_max_seconds
         self._log_debug_exception = log_debug_exception
+        self._write_lock = write_lock
         self._task: asyncio.Task | None = None
 
     def start(self, *, max_age_hours: int, temp_cleanup_hours: int):
@@ -123,21 +125,30 @@ class CleanupScheduler:
         cutoff = datetime.now() - timedelta(hours=max_age_hours)
         removed = 0
         removed_keys: list[str] = []
-        for key in sorted(self._thread_cache.all_session_keys()):
-            last = self._thread_cache.last_seen.get(key)
-            if last is None or last < cutoff:
-                try:
-                    self._thread_cache.last_seen.pop(key, None)
-                    self._thread_cache.threads.pop(key, None)
-                    self._thread_cache.stats_tracker.stats.pop(key, None)
-                    removed += 1
-                    removed_keys.append(key)
-                except Exception as exc:
-                    self._log_debug_exception(
-                        "QQRecord 清理会话失败",
-                        exc,
-                        stub=key,
-                    )
+
+        async def _do_cleanup():
+            nonlocal removed, removed_keys
+            for key in sorted(self._thread_cache.all_session_keys()):
+                last = self._thread_cache.last_seen.get(key)
+                if last is None or last < cutoff:
+                    try:
+                        self._thread_cache.last_seen.pop(key, None)
+                        self._thread_cache.threads.pop(key, None)
+                        self._thread_cache.stats_tracker.stats.pop(key, None)
+                        removed += 1
+                        removed_keys.append(key)
+                    except Exception as exc:
+                        self._log_debug_exception(
+                            "QQRecord 清理会话失败",
+                            exc,
+                            stub=key,
+                        )
+
+        if self._write_lock:
+            async with self._write_lock:
+                await _do_cleanup()
+        else:
+            await _do_cleanup()
         if removed:
             try:
                 preview = ", ".join(removed_keys[: self._cleanup_preview_limit])

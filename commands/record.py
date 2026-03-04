@@ -1,8 +1,5 @@
 from astrbot.api import logger
-from astrbot.api.event.filter import EventMessageType, PlatformAdapterType
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
-from collections import OrderedDict
-from datetime import datetime
 
 
 class RecordCommands:
@@ -18,14 +15,6 @@ class RecordCommands:
                 denied = await self._plugin._admin_denied_message(
                     event,
                     "仅管理员可查看记录。",
-                )
-                if denied:
-                    yield event.plain_result(denied)
-                    return
-            if self._plugin._export_admin_only:
-                denied = await self._plugin._admin_denied_message(
-                    event,
-                    "仅管理员可导出记录。",
                 )
                 if denied:
                     yield event.plain_result(denied)
@@ -95,7 +84,11 @@ class RecordCommands:
             if fmt and str(fmt).lower() == "md":
                 lines = [f"# 记录（{name}）", "", *lines]
 
-            await self._plugin._send_cache_as_file(event, lines, name, file_stub)
+            await self._plugin._send_cache_as_file(
+                event, lines, name, file_stub,
+                segment_len=self._plugin.DEFAULT_SEGMENT_LEN,
+                segment_delay=self._plugin.DEFAULT_SEGMENT_DELAY,
+            )
             self._plugin._bump_stat(file_stub, bool(lines))
         except (ValueError, TypeError) as exc:
             logger.warning("QQRecord /record_file 参数错误: %s", exc, exc_info=exc)
