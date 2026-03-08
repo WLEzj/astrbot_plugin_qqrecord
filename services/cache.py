@@ -60,7 +60,7 @@ class ThreadCache:
         for entry in threads.values():
             if entry.main:
                 lines.append(entry.main)
-            lines.extend(list(entry.replies))
+            lines.extend(entry.replies)
         return lines
 
     @staticmethod
@@ -68,7 +68,7 @@ class ThreadCache:
         lines: list[str] = []
         if entry.main:
             lines.append(entry.main)
-        lines.extend(list(entry.replies))
+        lines.extend(entry.replies)
         return lines
 
     def ensure_threads_session(self, stub: str):

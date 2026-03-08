@@ -1,5 +1,6 @@
 import os
 import uuid
+import time
 import asyncio
 
 from astrbot.api import logger
@@ -44,7 +45,7 @@ class Exporter:
             return
 
         safe_stub = (file_stub or "unknown").strip()
-        ts = asyncio.get_running_loop().time()
+        ts = time.time()
         fname = f"{self._temp_file_prefix}{safe_stub}-{ts}-{uuid.uuid4().hex}.txt"
         temp_dir = self._temp_dir_provider()
         os.makedirs(temp_dir, exist_ok=True)
